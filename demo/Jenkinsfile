@@ -1,0 +1,242 @@
+pipeline {
+    // =========================================================
+    // VM Agent：通过节点标签选择对应 Agent
+    // 节点标签规划：
+    //   build-agent - 通用 CI 构建节点（安装 docker, helm, git）
+    //
+    // 架构原则：
+    //   Jenkins 纯 CI——只负责代码拉取、测试、Docker 镜像构建与推送到 Harbor。
+    //   Jenkins 零 CD 逻辑，完全不触碰 GitLab B 配置仓库，完全不调用 ArgoCD API。
+    // =========================================================
+    agent {
+        label 'build-agent'
+    }
+
+    // =========================================================
+    // 全局环境变量
+    // =========================================================
+    environment {
+        // 代码仓库 (GitLab A)
+        APP_REPO_URL     = "https://gitlab-a.example.com/your-org/myapp.git"
+
+        // 镜像仓库 (Harbor)
+        HARBOR_URL       = "harbor.example.com"
+        HARBOR_PROJECT   = "myapp"
+        IMAGE_NAME       = "${HARBOR_URL}/${HARBOR_PROJECT}/myapp"
+
+        // Jenkins Credentials ID
+        GITLAB_A_CRED_ID = "gitlab-a-token"     // 代码仓库凭证
+        HARBOR_CRED_ID   = "harbor-credentials" // 镜像仓库凭证
+    }
+
+    // =========================================================
+    // 触发器（GitLab Webhook，代码提交或合并请求自动触发 CI）
+    // =========================================================
+    triggers {
+        gitlab(
+            triggerOnPush: true,
+            triggerOnMergeRequest: true,
+            branchFilterType: 'All'
+        )
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+    }
+
+    // =========================================================
+    // 流水线阶段 (纯 CI)
+    // =========================================================
+    stages {
+
+        // ---------------------------------------------------------
+        // Stage 1: 检出源码 (GitLab A)
+        // ---------------------------------------------------------
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${env.BRANCH_NAME}"]],
+                    userRemoteConfigs: [[
+                        url: env.APP_REPO_URL,
+                        credentialsId: env.GITLAB_A_CRED_ID
+                    ]],
+                    extensions: [
+                        [$class: 'CloneOption', depth: 1, shallow: true]
+                    ]
+                ])
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.GIT_COMMIT_MSG   = sh(script: "git log -1 --pretty=%B", returnStdout: true).trim()
+                    env.TARGET_ENV       = getTargetEnv(env.BRANCH_NAME)
+
+                    // 镜像 Tag 命名策略：
+                    //   Tag (v*.*.*)    → 直接保留 v1.2.3（供 prod 环境 semver 策略匹配）
+                    //   dev/test/uat 分支 → {env}-{commit_sha8}（供 latest 策略匹配）
+                    if (env.TAG_NAME && env.TAG_NAME.startsWith('v')) {
+                        env.IMAGE_TAG = env.TAG_NAME
+                    } else {
+                        env.IMAGE_TAG = "${env.TARGET_ENV}-${env.GIT_COMMIT_SHORT}"
+                    }
+
+                    echo "=== CI Build Context ==="
+                    echo "Branch/Tag: ${env.BRANCH_NAME ?: env.TAG_NAME}"
+                    echo "Target Env: ${env.TARGET_ENV}"
+                    echo "Image Tag : ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Stage 2: 代码编译与单元测试 (并行执行)
+        // ---------------------------------------------------------
+        stage('Build & Test') {
+            parallel {
+                stage('Unit Test') {
+                    steps {
+                        sh '''
+                            echo "=== Running Unit Tests ==="
+                            # 替换为具体语言的单测命令：
+                            # go test ./... -v -coverprofile=coverage.out
+                            # mvn test -q
+                            # npm test -- --ci
+                            echo "Unit tests completed."
+                        '''
+                    }
+                }
+                stage('Code Lint') {
+                    steps {
+                        sh '''
+                            echo "=== Running Code Lint ==="
+                            # golangci-lint run / eslint .
+                            echo "Code lint completed."
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Stage 3: Docker 构建 & 推送镜像到 Harbor
+        // ---------------------------------------------------------
+        stage('Docker Build & Push') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: env.HARBOR_CRED_ID,
+                        usernameVariable: 'HARBOR_USER',
+                        passwordVariable: 'HARBOR_PASS'
+                    )
+                ]) {
+                    sh """
+                        set -e
+                        echo "=== Docker Login to Harbor ==="
+                        echo "\${HARBOR_PASS}" | docker login ${HARBOR_URL} \
+                            -u "\${HARBOR_USER}" --password-stdin
+
+                        echo "=== Building Docker Image ==="
+                        docker build \
+                            --build-arg APP_ENV=${env.TARGET_ENV} \
+                            --build-arg BUILD_DATE=\$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                            --build-arg GIT_COMMIT=${env.GIT_COMMIT_SHORT} \
+                            -t ${IMAGE_NAME}:${env.IMAGE_TAG} \
+                            .
+
+                        echo "=== Pushing Image to Harbor ==="
+                        docker push ${IMAGE_NAME}:${env.IMAGE_TAG}
+
+                        echo "=== Cleanup Local Image ==="
+                        docker rmi ${IMAGE_NAME}:${env.IMAGE_TAG} || true
+
+                        echo "CI Completed: Image successfully pushed to ${IMAGE_NAME}:${env.IMAGE_TAG}"
+                    """
+                }
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Stage 4: Helm Chart 语法校验 (可选)
+        // ---------------------------------------------------------
+        stage('Helm Lint') {
+            steps {
+                sh '''
+                    echo "=== Helm Chart Lint ==="
+                    helm version --short
+                    # helm lint helm/app-chart/
+                    echo "Helm lint completed."
+                '''
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Stage 5: 镜像安全扫描 (可选)
+        // ---------------------------------------------------------
+        stage('Security Scan') {
+            when {
+                anyOf {
+                    branch 'uat'
+                    branch 'main'
+                    branch pattern: "release/.*", comparator: "REGEXP"
+                    tag pattern: "v.*", comparator: "REGEXP"
+                }
+            }
+            steps {
+                sh """
+                    echo "=== Running Security Scan (Trivy) ==="
+                    # trivy image --severity HIGH,CRITICAL ${IMAGE_NAME}:${env.IMAGE_TAG}
+                    echo "Security scan completed."
+                """
+            }
+        }
+    }
+
+    // =========================================================
+    // CI 构建完成后的总结通知
+    // =========================================================
+    post {
+        success {
+            echo """
+==================================================
+✅ CI 流水线构建成功！
+应用  : myapp
+环境  : ${env.TARGET_ENV}
+镜像  : ${IMAGE_NAME}:${env.IMAGE_TAG}
+分支  : ${env.BRANCH_NAME ?: env.TAG_NAME} (${env.GIT_COMMIT_SHORT})
+说明  : CI 流程已完成，镜像已入库。后续 CD 部署、蓝绿发布由 ArgoCD / Argo Rollouts 处理。
+=================================================="""
+        }
+        failure {
+            echo """
+==================================================
+❌ CI 流水线构建失败！
+应用  : myapp
+分支  : ${env.BRANCH_NAME ?: env.TAG_NAME}
+日志  : ${env.BUILD_URL}console
+=================================================="""
+        }
+        always {
+            cleanWs(
+                cleanWhenSuccess: true,
+                cleanWhenFailure: true,
+                cleanWhenAborted: true
+            )
+        }
+    }
+}
+
+// =========================================================
+// 工具函数：根据分支获取目标环境名称
+// =========================================================
+def getTargetEnv(String branchName) {
+    if (branchName == null)                                          return 'dev'
+    if (branchName == 'dev')                                         return 'dev'
+    if (branchName == 'test')                                        return 'test'
+    if (branchName == 'uat' || branchName.startsWith('uat-'))       return 'uat'
+    if (branchName == 'main' || branchName.startsWith('release/')
+        || branchName.startsWith('v'))                               return 'prod'
+    return 'dev'
+}
