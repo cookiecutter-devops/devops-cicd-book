@@ -1,0 +1,273 @@
+// ============================================================
+// Scaffold CI/CD Pipeline — Jenkinsfile
+//
+// 触发方式:
+//   - SCM 轮询 (推荐: H/5 * * * *)
+//   - 手动触发 (Jenkins UI → Build Now)
+//
+// 启用前必改（唯一一处）:
+//   REPO_ROOT → 本仓库在宿主机的绝对路径（须与 Jenkins 容器挂载路径一致，
+//   见 docker/docker-compose.jenkins.yml 的 REPO_HOST_DIR）
+//
+// 前提:
+//   1. Jenkins 容器已按 docker/docker-compose.jenkins.yml 挂载本仓库与 docker.sock
+//   2. 部署阶段需要 docker/.env 已配置生产 secrets（模板 docker/.env.template）
+//   3. 前端 rsync 部署需要 SSH 免密登录（不部署前端可勾 SKIP_FRONTEND）
+// ============================================================
+
+pipeline {
+    agent any
+
+    // ── 全局环境变量 ──
+    environment {
+        // 宿主项目路径（★ 启用前必改；docker compose 与 .env 在此）
+        REPO_ROOT      = '/path/to/scaffold'
+        // 后端镜像名（与 docker/docker-compose.prod.yml 的 image 一致）
+        BACKEND_IMAGE  = 'scaffold-backend:latest'
+
+        // 前端部署目标（rsync）。留空 HOST 则跳过部署、仅本地构建 dist
+        CLOUD_VPS_HOST = ''
+        CLOUD_VPS_USER = 'root'
+        CLOUD_VPS_PATH = '/var/www/scaffold'
+
+        // 健康检查目标（本机 prod 栈直出 gateway；有域名/反代则改公网 URL）
+        PROD_HEALTH_URL = 'http://localhost:8080/health'
+    }
+
+    // ── 构建选项 ──
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '30'))
+        timestamps()
+    }
+
+    // ── 构建参数 ──
+    parameters {
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: '跳过单元测试（加速构建）'
+        )
+        booleanParam(
+            name: 'SKIP_FRONTEND',
+            defaultValue: false,
+            description: '跳过前端构建与部署'
+        )
+        booleanParam(
+            name: 'SKIP_MIGRATE',
+            defaultValue: false,
+            description: '跳过数据库迁移（谨慎使用）'
+        )
+        booleanParam(
+            name: 'SKIP_DEPLOY',
+            defaultValue: false,
+            description: '跳过生产部署，仅构建镜像'
+        )
+    }
+
+    stages {
+
+        // ============================================================
+        // Stage 1: Checkout — 由 SCM 自动完成，这里只确认版本
+        // ============================================================
+        stage('Checkout') {
+            steps {
+                echo '📥 确认代码版本...'
+                sh '''
+                    echo "Branch: $(git rev-parse --abbrev-ref HEAD)"
+                    echo "Commit: $(git rev-parse --short HEAD)"
+                    echo "Message: $(git log -1 --pretty=%B | head -1)"
+                    echo ""
+                    echo "最近 5 条提交:"
+                    git log --oneline -5
+                '''
+            }
+        }
+
+        // ============================================================
+        // Stage 2: Test (单元测试) — 测试失败必须阻塞构建，不做尽力而为
+        // ============================================================
+        stage('Test') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                echo '🧪 运行单元测试...'
+                sh '''
+                    cd "${REPO_ROOT}/backend"
+                    if [ ! -f .venv/bin/pytest ]; then
+                        echo ".venv 不存在，现场重建（对齐 scripts/setup_venv.sh）..."
+                        python3 -m venv .venv
+                        .venv/bin/python -m pip install --quiet --upgrade pip
+                        .venv/bin/pip install --quiet -r requirements.txt
+                    fi
+                    # pytest.ini 默认排除 integration/e2e（需外部中间件），此处跑单测全集
+                    .venv/bin/pytest --timeout=120 -q
+                '''
+            }
+        }
+
+        // ============================================================
+        // Stage 3: Build Backend Image
+        // ============================================================
+        stage('Build Backend') {
+            steps {
+                echo '🐳 构建后端 Docker 镜像...'
+                sh '''
+                    docker build \
+                        -t "${BACKEND_IMAGE}" \
+                        -f "${REPO_ROOT}/backend/Dockerfile" \
+                        "${REPO_ROOT}/backend"
+                    docker images "${BACKEND_IMAGE}" --format "镜像: {{.Repository}}:{{.Tag}} | 大小: {{.Size}} | 构建于: {{.CreatedAt}}"
+                '''
+            }
+        }
+
+        // ============================================================
+        // Stage 4: Build Frontend (并行子阶段)
+        // ============================================================
+        stage('Build Frontend') {
+            when { expression { !params.SKIP_FRONTEND } }
+            parallel {
+                stage('Build admin') {
+                    steps {
+                        echo '🏗️  构建管理后台 (admin)...'
+                        sh '''
+                            cd "${REPO_ROOT}/frontend/admin"
+                            npm ci --registry=https://registry.npmmirror.com
+                            npm run build
+                        '''
+                    }
+                }
+                stage('Build webapp') {
+                    steps {
+                        echo '🏗️  构建 Web 用户端 (webapp)...'
+                        sh '''
+                            cd "${REPO_ROOT}/frontend/webapp"
+                            npm ci --registry=https://registry.npmmirror.com
+                            npm run build
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        // Stage 5: Deploy Frontend → 目标主机
+        // ============================================================
+        stage('Deploy Frontend') {
+            when {
+                allOf {
+                    expression { !params.SKIP_FRONTEND }
+                    expression { env.CLOUD_VPS_HOST != '' }
+                }
+            }
+            steps {
+                echo '📤 部署前端到目标主机...'
+                sh '''
+                    set -e
+                    cd "${REPO_ROOT}/frontend"
+                    for app in admin webapp; do
+                        if [ -d "$app/dist" ]; then
+                            echo "  同步 $app/dist/ → ${CLOUD_VPS_HOST}:${CLOUD_VPS_PATH}/$app/"
+                            rsync -avz --delete \
+                                -e "ssh -o StrictHostKeyChecking=accept-new" \
+                                "$app/dist/" \
+                                "${CLOUD_VPS_USER}@${CLOUD_VPS_HOST}:${CLOUD_VPS_PATH}/$app/"
+                        else
+                            echo "  ⚠️  $app/dist/ 不存在，跳过"
+                        fi
+                    done
+                '''
+            }
+        }
+
+        // ============================================================
+        // Stage 6: Database Migrate
+        // ============================================================
+        stage('Migrate') {
+            when { expression { !params.SKIP_MIGRATE && !params.SKIP_DEPLOY } }
+            steps {
+                echo '🗄️  执行数据库迁移...'
+                sh '''
+                    # .env 不在仓库中（.gitignore 排除），在宿主 REPO_ROOT/docker/ 下
+                    ENV_FILE="${REPO_ROOT}/docker/.env"
+                    COMPOSE_FILE="${REPO_ROOT}/docker/docker-compose.prod.yml"
+
+                    if [ ! -f "$ENV_FILE" ]; then
+                        echo "❌ $ENV_FILE 不存在！请先按 docker/.env.template 配置生产环境变量。"
+                        exit 1
+                    fi
+
+                    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" --profile migrate run --rm migrate
+                '''
+            }
+        }
+
+        // ============================================================
+        // Stage 7: Deploy Backend
+        // ============================================================
+        stage('Deploy Backend') {
+            when { expression { !params.SKIP_DEPLOY } }
+            steps {
+                echo '🚀 部署生产后端...'
+                sh '''
+                    ENV_FILE="${REPO_ROOT}/docker/.env"
+                    COMPOSE_FILE="${REPO_ROOT}/docker/docker-compose.prod.yml"
+
+                    if [ ! -f "$ENV_FILE" ]; then
+                        echo "❌ $ENV_FILE 不存在！请先按 docker/.env.template 配置生产环境变量。"
+                        exit 1
+                    fi
+
+                    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --remove-orphans
+
+                    echo ""
+                    echo "等待容器健康检查..."
+                    sleep 5
+                    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps
+                '''
+            }
+        }
+
+        // ============================================================
+        // Stage 8: Health Check
+        // ============================================================
+        stage('Health Check') {
+            when { expression { !params.SKIP_DEPLOY } }
+            steps {
+                echo '🩺 健康检查...'
+                sh '''
+                    sleep 10
+                    for i in 1 2 3; do
+                        echo "  尝试 $i/3: ${PROD_HEALTH_URL}"
+                        if curl -f -s -o /dev/null -w "HTTP %{http_code}" "${PROD_HEALTH_URL}"; then
+                            echo ""
+                            echo "✅ 生产后端健康检查通过！"
+                            exit 0
+                        fi
+                        echo " (失败，等待5秒重试...)"
+                        sleep 5
+                    done
+                    echo ""
+                    echo "⚠️  健康检查全部失败，请手动验证。"
+                    exit 1
+                '''
+            }
+        }
+    }
+
+    // ── 后置操作 ──
+    post {
+        success {
+            echo '🎉 CI/CD 流水线执行成功！'
+        }
+        failure {
+            echo '❌ CI/CD 流水线执行失败，请检查日志。'
+        }
+        always {
+            echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+            sh 'echo "构建完成时间: $(date \'+%Y-%m-%d %H:%M:%S %Z\')"'
+            echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+        }
+    }
+}

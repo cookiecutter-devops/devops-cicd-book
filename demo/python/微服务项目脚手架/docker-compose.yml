@@ -1,0 +1,119 @@
+# Scaffold 开发中间件一键起栈：PostgreSQL + Redis + RabbitMQ + Nacos
+#
+# 用法：
+#   docker compose up -d            # 起全部（首次会拉镜像）
+#   docker compose ps               # 确认 4 个 healthy
+#   docker compose down             # 停止（保留数据卷）
+#   docker compose down -v          # 停止并清空数据卷（重置）
+#
+# 连接信息与 backend/config/dev_config.yaml 默认值一致：
+#   PG      : localhost:${SCAFFOLD_PG_PORT:-5433}  db=scaffold_dev  user=scaffold  pwd=scaffold_dev
+#             （默认 5433→5432，避开同机生产栈占用的 127.0.0.1:5432）
+#   Redis   : localhost:${SCAFFOLD_REDIS_PORT:-6379}  pwd=redis_dev
+#   RabbitMQ: localhost:${SCAFFOLD_RABBITMQ_PORT:-5672} / 控制台 ${SCAFFOLD_RABBITMQ_MGMT_PORT:-15672}
+#   Nacos   : localhost:${SCAFFOLD_NACOS_PORT:-8849} (HTTP) / ${SCAFFOLD_NACOS_GRPC_PORT:-9849} (gRPC 备用)
+#
+# 宿主端口被其他项目占用时（同机多栈共存）：复制根部 .env.example 为 .env，
+# 改端口后重新 up（backend 侧须同步改 config/.env.dev 的连接端口）。
+# 改这些值时记得同步 dev_config.yaml 的 ${VAR:default}。
+
+name: scaffold-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: scaffold-postgres
+    environment:
+      POSTGRES_USER: scaffold
+      POSTGRES_PASSWORD: scaffold_dev
+      POSTGRES_DB: scaffold_dev
+      TZ: Asia/Shanghai
+    ports:
+      - "${SCAFFOLD_PG_PORT:-5433}:5432"
+    volumes:
+      - scaffold_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scaffold -d scaffold_dev"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: scaffold-redis
+    # AOF 持久化：重启/宕机不丢已入队任务消息与限流计数
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass redis_dev
+    ports:
+      - "${SCAFFOLD_REDIS_PORT:-6379}:6379"
+    volumes:
+      - scaffold_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "redis_dev", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: scaffold-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin123
+      TZ: Asia/Shanghai
+    ports:
+      - "${SCAFFOLD_RABBITMQ_PORT:-5672}:5672" # AMQP
+      - "${SCAFFOLD_RABBITMQ_MGMT_PORT:-15672}:15672" # 管理控制台 (admin/admin123)
+    volumes:
+      - scaffold_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  nacos:
+    # v2.5.2；JVM 堆限额防本机内存被默认值吃满
+    image: nacos/nacos-server:v2.5.2
+    container_name: scaffold-nacos
+    environment:
+      MODE: standalone
+      PREFER_HOST_MODE: hostname
+      TZ: Asia/Shanghai
+      NACOS_AUTH_ENABLE: "true"
+      # Base64 编码，原始密钥 ≥32 字符
+      NACOS_AUTH_TOKEN: U2NhZmZvbGROYWNvc0F1dGhUb2tlblRlc3RLZXkwMTIzNDU2Nzg5
+      NACOS_AUTH_IDENTITY_KEY: "serverIdentity"
+      NACOS_AUTH_IDENTITY_VALUE: "scaffold-dev-identity"
+      JVM_XMS: 256m
+      JVM_XMX: 384m
+    ports:
+      - "${SCAFFOLD_NACOS_PORT:-8849}:8848" # Nacos HTTP API + 控制台 (nacos/nacos)
+      - "${SCAFFOLD_NACOS_GRPC_PORT:-9849}:9848" # Nacos gRPC
+    volumes:
+      - scaffold_nacos_data:/home/nacos/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fs http://localhost:8848/nacos/v1/console/health/readiness || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  scaffold_pg_data:
+  scaffold_redis_data:
+  scaffold_rabbitmq_data:
+  scaffold_nacos_data:
